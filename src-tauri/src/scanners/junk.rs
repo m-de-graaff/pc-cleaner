@@ -211,6 +211,7 @@ pub fn scan_location(l: &JunkLocation, now: SystemTime) -> Option<Finding> {
         reason: format!("{} in {} files. {}", format_bytes(stats.bytes), stats.files, l.explanation),
         requires_admin: l.requires_admin,
         reversible: false,
+        upper_bound: false,
         action: Action::DeleteContents { root: l.root.clone(), filter: l.filter.clone(), min_age_hours: l.min_age_hours },
     })
 }
@@ -234,6 +235,7 @@ pub fn recycle_bin_finding(bytes: u64, items: u64) -> Option<Finding> {
         ),
         requires_admin: false,
         reversible: false,
+        upper_bound: false,
         action: Action::EmptyRecycleBin,
     })
 }
@@ -290,11 +292,7 @@ mod tests {
     use super::*;
     use crate::fsutil::test_support::file;
 
-    struct FakeSys(u64, u64);
-    impl SystemOps for FakeSys {
-        fn recycle_bin_info(&self) -> (u64, u64) { (self.0, self.1) }
-        fn empty_recycle_bin(&self) -> Result<(), String> { Ok(()) }
-    }
+    use crate::sys::fake::FakeSys;
 
     fn fake_paths(dir: &Path) -> KnownPaths {
         KnownPaths {
@@ -339,7 +337,7 @@ mod tests {
         file(&p.temp.join("old.tmp"), 10, 48);
         let seen = std::sync::Mutex::new(Vec::new());
 
-        let found = scan_junk_with_progress(&p, &FakeSys(0, 0), SystemTime::now(), &|pr| seen.lock().unwrap().push(pr));
+        let found = scan_junk_with_progress(&p, &FakeSys::with_bin(0, 0), SystemTime::now(), &|pr| seen.lock().unwrap().push(pr));
 
         let seen = seen.into_inner().unwrap();
         let total = junk_locations(&p).len() + 1; // + Recycle Bin
@@ -349,7 +347,7 @@ mod tests {
         done.sort();
         assert_eq!(done, (1..=total).collect::<Vec<_>>());
         assert!(seen.iter().any(|s| s.title == "Your temporary files"));
-        assert_eq!(titles(&found), titles(&scan_junk(&p, &FakeSys(0, 0), SystemTime::now())));
+        assert_eq!(titles(&found), titles(&scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now())));
     }
 
     #[test]
@@ -362,7 +360,7 @@ mod tests {
         file(&p.home.join(".cargo/registry/src/index.crates.io-1/serde-1.0.0/lib.rs"), 10, 0);
         file(&p.home.join(".gradle/caches/modules-2/x.jar"), 10, 0);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         for title in ["npm cache", "pnpm store", "Cargo downloaded crates", "Cargo extracted sources", "Gradle caches"] {
             let f = find(&found, title);
             assert_eq!(f.risk, Risk::Review, "{title}");
@@ -377,7 +375,7 @@ mod tests {
         file(&p.app_data.join("Code/CachedData/abc/x.bin"), 10, 0);
         file(&p.local_app_data.join("D3DSCache/x"), 10, 0);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         assert_eq!(find(&found, "VS Code cache (CachedData)").risk, Risk::Safe);
         assert_eq!(find(&found, "DirectX shader cache").risk, Risk::Safe);
     }
@@ -391,7 +389,7 @@ mod tests {
         file(&custom.join("registry/cache/idx/a.crate"), 30, 0);
         file(&p.home.join(".cargo/registry/cache/idx/b.crate"), 99, 0);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         let cargo = find(&found, "Cargo downloaded crates");
         assert_eq!(cargo.size_bytes, 30);
         assert_eq!(found.iter().filter(|f| f.title == "Cargo downloaded crates").count(), 1);
@@ -408,7 +406,7 @@ mod tests {
         file(&p.temp.join("old.tmp"), 2048, 48);
         file(&p.temp.join("new.tmp"), 4096, 1);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         let temp = found.iter().find(|f| f.title == "Your temporary files").unwrap();
         assert_eq!(temp.size_bytes, 2048);
         assert_eq!(temp.item_count, 1);
@@ -422,7 +420,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let p = fake_paths(dir.path());
         std::fs::create_dir_all(p.local_app_data.join("CrashDumps")).unwrap();
-        assert!(scan_junk(&p, &FakeSys(0, 0), SystemTime::now()).is_empty());
+        assert!(scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now()).is_empty());
     }
 
     #[test]
@@ -432,7 +430,7 @@ mod tests {
         file(&p.windows.join("Temp/old.log"), 10, 48);
         file(&p.windows.join("SoftwareDistribution/Download/kb.cab"), 10, 100);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         let win = found.iter().find(|f| f.title == "Windows temporary files").unwrap();
         assert!(win.requires_admin);
         let wu = found.iter().find(|f| f.title == "Windows Update downloads").unwrap();
@@ -447,7 +445,7 @@ mod tests {
         file(&explorer.join("thumbcache_256.db"), 100, 0);
         file(&explorer.join("iconcache_256.db"), 999, 0);
 
-        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         let thumbs = found.iter().find(|f| f.title == "Thumbnail cache").unwrap();
         assert_eq!(thumbs.size_bytes, 100);
     }
@@ -461,7 +459,7 @@ mod tests {
         file(&chrome.join("Profile 1/Code Cache/js/abc"), 10, 0);
         file(&p.local_app_data.join("Mozilla/Firefox/Profiles/x1.default/cache2/entries/E1"), 10, 0);
 
-        let found = titles(&scan_junk(&p, &FakeSys(0, 0), SystemTime::now()));
+        let found = titles(&scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now()));
         assert!(found.contains(&"Chrome cache (Default)".to_string()));
         assert!(found.contains(&"Chrome code cache (Profile 1)".to_string()));
         assert!(found.contains(&"Firefox cache (x1.default)".to_string()));
@@ -482,7 +480,7 @@ mod tests {
         let p = fake_paths(dir.path());
         file(&p.temp.join("big.tmp"), 20 * 1024 * 1024, 48);
         file(&p.local_app_data.join("CrashDumps/a.dmp"), 10, 0);
-        let found = scan_junk(&p, &FakeSys(5 * 1024 * 1024, 1), SystemTime::now());
+        let found = scan_junk(&p, &FakeSys::with_bin(5 * 1024 * 1024, 1), SystemTime::now());
         let scores: Vec<u8> = found.iter().map(|f| f.score).collect();
         let mut sorted = scores.clone();
         sorted.sort_by(|a, b| b.cmp(a));

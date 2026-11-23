@@ -5,6 +5,15 @@ use std::path::PathBuf;
 #[serde(rename_all = "lowercase")]
 pub enum Category {
     Junk,
+    DevTools,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum DockerTarget {
+    BuildCache,
+    Images,
+    Containers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -43,6 +52,13 @@ pub enum Action {
     #[serde(rename_all = "camelCase")]
     DeleteContents { root: PathBuf, filter: NameFilter, min_age_hours: u64 },
     EmptyRecycleBin,
+    DockerPrune { target: DockerTarget },
+    DockerRemoveVolume { name: String },
+    /// Shut down WSL and compact this virtual disk so space freed inside it returns to Windows.
+    CompactDisk { path: PathBuf },
+    RemoveToolchain { name: String },
+    /// Delete these files or folders (folders recursively).
+    DeletePaths { paths: Vec<PathBuf> },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -60,6 +76,9 @@ pub struct Finding {
     pub reason: String,
     pub requires_admin: bool,
     pub reversible: bool,
+    /// `size_bytes` is a maximum, not an estimate (disk compaction); left out of totals.
+    #[serde(default)]
+    pub upper_bound: bool,
     pub action: Action,
 }
 
@@ -83,5 +102,16 @@ mod tests {
         assert_eq!(json["kind"], "deleteContents");
         assert_eq!(json["minAgeHours"], 24);
         assert_eq!(serde_json::to_value(Action::EmptyRecycleBin).unwrap()["kind"], "emptyRecycleBin");
+    }
+
+    #[test]
+    fn dev_tool_actions_serialize_for_the_frontend() {
+        let prune = serde_json::to_value(Action::DockerPrune { target: DockerTarget::BuildCache }).unwrap();
+        assert_eq!(prune["kind"], "dockerPrune");
+        assert_eq!(prune["target"], "buildCache");
+        assert_eq!(serde_json::to_value(Action::CompactDisk { path: "C:\\d.vhdx".into() }).unwrap()["kind"], "compactDisk");
+        assert_eq!(serde_json::to_value(Action::RemoveToolchain { name: "1.85".into() }).unwrap()["kind"], "removeToolchain");
+        assert_eq!(serde_json::to_value(Action::DeletePaths { paths: vec![] }).unwrap()["kind"], "deletePaths");
+        assert_eq!(serde_json::to_value(Category::DevTools).unwrap(), "devtools");
     }
 }

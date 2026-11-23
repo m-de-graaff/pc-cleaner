@@ -81,6 +81,31 @@ Junk locations:
 
 Developer caches are marked review, not safe. They can always be regenerated, but downloading them again costs time and bandwidth, and clearing one while an install or build is running can break that run. The pnpm store is hard-linked into projects, so its reported size can overstate what clearing it actually frees. Its reason text recommends `pnpm store prune` instead. Package caches often mark files read-only; Rust's `std::fs::remove_file` on Windows deletes those anyway, and a regression test guards it. Project build outputs (`node_modules`, `target`) belong to piece 2.
 
+### Piece 1b — Dev tools (approved 2026-11-23, needs piece 1)
+
+A separate "Dev tools" page that uses the same scan → review → clean flow, guard and journal. Findings have category `devtools`. Some actions run external tools. The backend builds those commands from a fixed set, never from user input, and the frontend still sends only finding IDs. Commands run through `SystemOps::run`, so tests can fake them.
+
+| Finding | How it's found | Action | Risk | Admin |
+|---|---|---|---|---|
+| Docker build cache | `docker system df` "Build Cache" reclaimable | `docker builder prune -f` | safe | no |
+| Unused Docker images | `docker system df` "Images" reclaimable | `docker image prune -a -f` | review | no |
+| Stopped Docker containers | `docker system df` "Containers" reclaimable | `docker container prune -f` | review | no |
+| Unused Docker volume `<name>`, one per volume | `docker volume ls -q --filter dangling=true`, sizes from `docker system df -v` | `docker volume rm <name>` | caution | no |
+| Compact WSL disk `<name>` | `ext4.vhdx`/`docker_data.vhdx` under `%LOCALAPPDATA%\Packages\*\LocalState`, `%LOCALAPPDATA%\Docker\wsl\*`, `%LOCALAPPDATA%\wsl\*` | `wsl --shutdown`, then `diskpart` `compact vdisk` | review | yes |
+| Rust toolchain `<name>`, except the default and active ones | `rustup toolchain list` | `rustup toolchain uninstall <name>` | review | no |
+| Android emulator `<name>` | `%ANDROID_AVD_HOME%` or `~\.android\avd\*.avd` plus its `.ini` | delete both | caution | no |
+| JetBrains IDE caches | `%LOCALAPPDATA%\JetBrains\<product>\caches` (junk scanner) | delete contents | safe | no |
+
+- **Docker not running.** The page shows a notice telling you to start Docker Desktop, and lists no Docker findings.
+- **Sizes for disk compaction are an upper bound.** The finding shows the disk file's size ("up to"), and that size is left out of the selected total. The real result is measured from the file size before and after compacting.
+- **Order of execution.** The executor always runs compaction last, so space freed by Docker prunes in the same run is returned to Windows.
+- **Confirmation warning.** The dialog warns that compaction shuts down WSL and Docker.
+
+Left out on purpose:
+- Unregistering WSL distros: that removes a whole Linux install, so it belongs with uninstall in piece 3.
+- `ProgramData\Package Cache`: deleting it breaks repair and uninstall for installed apps.
+- Cleaning inside Linux.
+
 ### Piece 2 — Old dev projects + large/duplicate files (needs piece 1)
 
 - **Projects**: a folder counts as a project root if it contains `.git`, `package.json`, `*.csproj`/`*.sln`, `Cargo.toml`, `pyproject.toml`/`requirements.txt`, `pom.xml`/`build.gradle` or `go.mod`. A project is *stale* when its newest source file (artifacts excluded) is more than 6 months old. The default action strips artifacts: `node_modules`, `bin`/`obj`, `target`, `.venv`/`venv`, `dist`/`build`, `.next`, `__pycache__`, `.gradle`. The source is kept.

@@ -3,6 +3,57 @@ pub trait SystemOps: Send + Sync {
     /// (total bytes, item count) across all drives' Recycle Bins.
     fn recycle_bin_info(&self) -> (u64, u64);
     fn empty_recycle_bin(&self) -> Result<(), String>;
+    /// Run a program with a backend-built argument list. Ok(stdout) on exit code 0,
+    /// otherwise Err(stderr, or the exit code when stderr is empty).
+    fn run(&self, program: &str, args: &[&str]) -> Result<String, String>;
+}
+
+/// Test double: canned command output keyed by "program arg1 arg2", and a log of what ran.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::SystemOps;
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    #[derive(Default)]
+    pub struct FakeSys {
+        pub bin: (u64, u64),
+        pub responses: HashMap<String, Result<String, String>>,
+        pub calls: Mutex<Vec<String>>,
+        pub emptied: AtomicBool,
+    }
+
+    impl FakeSys {
+        pub fn with_bin(bytes: u64, items: u64) -> Self {
+            Self { bin: (bytes, items), ..Default::default() }
+        }
+        pub fn respond(mut self, command: &str, output: Result<&str, &str>) -> Self {
+            self.responses.insert(command.to_string(), output.map(String::from).map_err(String::from));
+            self
+        }
+        pub fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+        pub fn was_emptied(&self) -> bool {
+            self.emptied.load(Ordering::SeqCst)
+        }
+    }
+
+    impl SystemOps for FakeSys {
+        fn recycle_bin_info(&self) -> (u64, u64) {
+            self.bin
+        }
+        fn empty_recycle_bin(&self) -> Result<(), String> {
+            self.emptied.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        fn run(&self, program: &str, args: &[&str]) -> Result<String, String> {
+            let key = std::iter::once(program).chain(args.iter().copied()).collect::<Vec<_>>().join(" ");
+            self.calls.lock().unwrap().push(key.clone());
+            self.responses.get(&key).cloned().unwrap_or_else(|| Err("not installed".into()))
+        }
+    }
 }
 
 use serde::Serialize;
@@ -49,6 +100,21 @@ impl SystemOps for WindowsSys {
             Ok(())
         }
     }
+
+    fn run(&self, program: &str, args: &[&str]) -> Result<String, String> {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let out = std::process::Command::new(program)
+            .args(args)
+            .creation_flags(CREATE_NO_WINDOW)
+            .output()
+            .map_err(|e| format!("{program}: {e}"))?;
+        if out.status.success() {
+            Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+        } else {
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            Err(if stderr.is_empty() { format!("{program} exited with {}", out.status) } else { stderr })
+        }
+    }
 }
 
 pub fn drive_usage(root: &str) -> Option<DriveUsage> {
@@ -93,6 +159,13 @@ mod tests {
         let d = drive_usage("C:\\").expect("C: exists");
         assert!(d.total_bytes > 0);
         assert!(d.free_bytes <= d.total_bytes);
+    }
+
+    #[test]
+    fn run_returns_stdout_or_error() {
+        assert_eq!(WindowsSys.run("cmd", &["/c", "echo hi"]).unwrap().trim(), "hi");
+        assert!(WindowsSys.run("cmd", &["/c", "exit 3"]).is_err());
+        assert!(WindowsSys.run("definitely-not-a-program-xyz", &[]).is_err());
     }
 
     #[test]

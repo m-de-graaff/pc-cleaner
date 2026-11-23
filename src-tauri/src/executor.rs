@@ -111,6 +111,7 @@ impl Executor<'_> {
                     }
                 }
             }
+            _ => r.skipped = Some("Not supported yet".into()),
         }
         r
     }
@@ -119,6 +120,11 @@ impl Executor<'_> {
         let action_kind = match f.action {
             Action::DeleteContents { .. } => "deleteContents",
             Action::EmptyRecycleBin => "emptyRecycleBin",
+            Action::DockerPrune { .. } => "dockerPrune",
+            Action::DockerRemoveVolume { .. } => "dockerRemoveVolume",
+            Action::CompactDisk { .. } => "compactDisk",
+            Action::RemoveToolchain { .. } => "removeToolchain",
+            Action::DeletePaths { .. } => "deletePaths",
         };
         let entry = JournalEntry {
             timestamp: unix_secs(self.now),
@@ -143,22 +149,10 @@ mod tests {
     use super::*;
     use crate::fsutil::test_support::{age, file};
     use crate::model::{Category, NameFilter, Risk};
+    use crate::sys::fake::FakeSys;
     use std::path::Path;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    struct FakeSys {
-        bytes: u64,
-        emptied: AtomicBool,
-    }
-    impl SystemOps for FakeSys {
-        fn recycle_bin_info(&self) -> (u64, u64) { (self.bytes, 1) }
-        fn empty_recycle_bin(&self) -> Result<(), String> {
-            self.emptied.store(true, Ordering::SeqCst);
-            Ok(())
-        }
-    }
-
-    fn fake(bytes: u64) -> FakeSys { FakeSys { bytes, emptied: AtomicBool::new(false) } }
+    fn fake(bytes: u64) -> FakeSys { FakeSys::with_bin(bytes, 1) }
 
     fn junk(root: &Path, min_age_hours: u64, requires_admin: bool) -> Finding {
         Finding {
@@ -173,6 +167,7 @@ mod tests {
             reason: String::new(),
             requires_admin,
             reversible: false,
+            upper_bound: false,
             action: Action::DeleteContents { root: root.to_path_buf(), filter: NameFilter::any(), min_age_hours },
         }
     }
@@ -245,7 +240,7 @@ mod tests {
         assert!(report.dry_run);
         assert_eq!(report.total_freed, 600);
         assert!(root.join("old.tmp").exists());
-        assert!(!sys.emptied.load(Ordering::SeqCst));
+        assert!(!sys.was_emptied());
     }
 
     #[test]
@@ -280,7 +275,7 @@ mod tests {
         let e = env();
         let sys = fake(1234);
         let report = exec(&e, &e.open, &sys, false).run(&[recycle()], false);
-        assert!(sys.emptied.load(Ordering::SeqCst));
+        assert!(sys.was_emptied());
         assert_eq!(report.total_freed, 1234);
     }
 
