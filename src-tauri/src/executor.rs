@@ -1,6 +1,6 @@
 use crate::fsutil::{candidates, old_dirs, unix_secs};
 use crate::journal::{Journal, JournalEntry};
-use crate::model::{Action, Finding};
+use crate::model::{Action, DockerTarget, Finding};
 use crate::protect::ProtectedSet;
 use crate::sys::SystemOps;
 use serde::Serialize;
@@ -35,11 +35,42 @@ pub struct Executor<'a> {
 
 const MAX_ERRORS: usize = 5;
 
+pub fn compact_script_path() -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("pc-cleaner-compact-{}.txt", std::process::id()))
+}
+
+/// diskpart script that compacts a virtual disk. Attaching read-only is enough for compaction
+/// and guarantees diskpart never writes the filesystem inside it.
+pub fn compact_script(disk: &std::path::Path) -> String {
+    format!("select vdisk file=\"{}\"\r\nattach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\n", disk.display())
+}
+
+/// "Total reclaimed space: 1.5GB" from docker prune output.
+fn reclaimed_from_docker(output: &str) -> Option<u64> {
+    output
+        .lines()
+        .find_map(|l| l.trim().strip_prefix("Total reclaimed space:"))
+        .and_then(|s| crate::scanners::devtools::parse_docker_size(s.trim()))
+}
+
+fn path_size(path: &std::path::Path) -> u64 {
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.is_dir() => {
+            crate::fsutil::summarize(path, &crate::model::NameFilter::any(), Duration::ZERO, SystemTime::now()).bytes
+        }
+        Ok(md) => md.len(),
+        Err(_) => 0,
+    }
+}
+
 
 impl Executor<'_> {
     pub fn run(&self, findings: &[Finding], dry_run: bool) -> ExecReport {
-        let items: Vec<ItemResult> = findings
-            .iter()
+        // Compaction goes last so space freed by Docker prunes in the same run is returned too.
+        let mut ordered: Vec<&Finding> = findings.iter().collect();
+        ordered.sort_by_key(|f| matches!(f.action, Action::CompactDisk { .. }));
+        let items: Vec<ItemResult> = ordered
+            .into_iter()
             .map(|f| {
                 let result = self.run_one(f, dry_run);
                 self.record(f, &result, dry_run);
@@ -111,9 +142,91 @@ impl Executor<'_> {
                     }
                 }
             }
-            _ => r.skipped = Some("Not supported yet".into()),
+            Action::DockerPrune { target } => {
+                let args: &[&str] = match target {
+                    DockerTarget::BuildCache => &["builder", "prune", "-f"],
+                    DockerTarget::Images => &["image", "prune", "-a", "-f"],
+                    DockerTarget::Containers => &["container", "prune", "-f"],
+                };
+                self.run_command(&mut r, f, dry_run, "docker", args);
+            }
+            Action::DockerRemoveVolume { name } => self.run_command(&mut r, f, dry_run, "docker", &["volume", "rm", name]),
+            Action::RemoveToolchain { name } => {
+                self.run_command(&mut r, f, dry_run, "rustup", &["toolchain", "uninstall", name])
+            }
+            Action::CompactDisk { path } => {
+                if dry_run {
+                    r.deleted_count = 1; // the size is only a maximum, so nothing is counted as freed
+                    return r;
+                }
+                let before = path_size(path);
+                if let Err(e) = self.compact(path) {
+                    r.failed_count = 1;
+                    r.errors.push(e);
+                    return r;
+                }
+                r.freed_bytes = before.saturating_sub(path_size(path));
+                r.deleted_count = 1;
+            }
+            Action::DeletePaths { paths } => {
+                for path in paths {
+                    if let Err(d) = self.protect.check(path) {
+                        r.failed_count += 1;
+                        r.errors.push(format!("{}: blocked by safety guard: {d}", path.display()));
+                        continue;
+                    }
+                    let size = path_size(path);
+                    let result = if dry_run {
+                        Ok(())
+                    } else if path.is_dir() {
+                        std::fs::remove_dir_all(path)
+                    } else {
+                        std::fs::remove_file(path)
+                    };
+                    match result {
+                        Ok(()) => {
+                            r.freed_bytes += size;
+                            r.deleted_count += 1;
+                        }
+                        Err(e) => {
+                            r.failed_count += 1;
+                            r.errors.push(format!("{}: {e}", path.display()));
+                        }
+                    }
+                }
+            }
         }
         r
+    }
+
+    /// Run a tool for a finding. Freed space comes from docker's own report when present,
+    /// otherwise from the scan's size.
+    fn run_command(&self, r: &mut ItemResult, f: &Finding, dry_run: bool, program: &str, args: &[&str]) {
+        if dry_run {
+            r.freed_bytes = f.size_bytes;
+            r.deleted_count = 1;
+            return;
+        }
+        match self.sys.run(program, args) {
+            Ok(out) => {
+                r.freed_bytes = reclaimed_from_docker(&out).unwrap_or(f.size_bytes);
+                r.deleted_count = 1;
+            }
+            Err(e) => {
+                r.failed_count = 1;
+                r.errors.push(e);
+            }
+        }
+    }
+
+    fn compact(&self, disk: &std::path::Path) -> Result<(), String> {
+        self.protect.check(disk).map_err(|d| format!("Blocked by safety guard: {d}"))?;
+        self.sys.run("wsl", &["--shutdown"])?;
+        let script = compact_script_path();
+        std::fs::write(&script, compact_script(disk)).map_err(|e| e.to_string())?;
+        let result = self.sys.run("diskpart", &["/s", &script.to_string_lossy()]);
+        let _ = std::fs::remove_file(&script);
+        result.map(|_| ())
     }
 
     fn record(&self, f: &Finding, r: &ItemResult, dry_run: bool) {
@@ -148,7 +261,7 @@ impl Executor<'_> {
 mod tests {
     use super::*;
     use crate::fsutil::test_support::{age, file};
-    use crate::model::{Category, NameFilter, Risk};
+    use crate::model::{Category, DockerTarget, NameFilter, Risk};
     use crate::sys::fake::FakeSys;
     use std::path::Path;
 
@@ -208,6 +321,123 @@ mod tests {
         assert!(!root.join("sub").exists(), "emptied old subfolder is removed");
         assert!(root.join("new.tmp").exists());
         assert!(root.exists());
+    }
+
+    fn dev(id: &str, size: u64, requires_admin: bool, action: Action) -> Finding {
+        Finding { id: id.into(), category: Category::DevTools, size_bytes: size, requires_admin, action, ..junk(Path::new("C:\\"), 0, false) }
+    }
+
+    #[test]
+    fn docker_prune_runs_docker_and_reads_reclaimed_space() {
+        let e = env();
+        let sys = fake(0).respond("docker builder prune -f", Ok("Deleted build cache\nTotal reclaimed space: 1.5GB\n"));
+        let f = dev("d", 9, false, Action::DockerPrune { target: DockerTarget::BuildCache });
+
+        let report = exec(&e, &e.open, &sys, false).run(&[f], false);
+
+        assert_eq!(sys.calls(), vec!["docker builder prune -f"]);
+        assert_eq!(report.total_freed, 1_500_000_000);
+    }
+
+    #[test]
+    fn failed_command_is_reported_not_counted() {
+        let e = env();
+        let sys = fake(0).respond("docker image prune -a -f", Err("daemon not running"));
+        let f = dev("d", 9, false, Action::DockerPrune { target: DockerTarget::Images });
+
+        let report = exec(&e, &e.open, &sys, false).run(&[f], false);
+
+        assert_eq!((report.items[0].failed_count, report.total_freed), (1, 0));
+        assert_eq!(report.items[0].errors, vec!["daemon not running"]);
+    }
+
+    #[test]
+    fn volume_and_toolchain_removal_run_their_commands() {
+        let e = env();
+        let sys = fake(0)
+            .respond("docker volume rm pgdata", Ok("pgdata\n"))
+            .respond("rustup toolchain uninstall 1.85-x86_64-pc-windows-msvc", Ok(""));
+        let findings = [
+            dev("v", 100, false, Action::DockerRemoveVolume { name: "pgdata".into() }),
+            dev("t", 200, false, Action::RemoveToolchain { name: "1.85-x86_64-pc-windows-msvc".into() }),
+        ];
+
+        let report = exec(&e, &e.open, &sys, false).run(&findings, false);
+
+        assert_eq!(report.total_freed, 300);
+        assert_eq!(sys.calls(), vec!["docker volume rm pgdata", "rustup toolchain uninstall 1.85-x86_64-pc-windows-msvc"]);
+    }
+
+    #[test]
+    fn compaction_shuts_down_wsl_then_runs_diskpart_last() {
+        let e = env();
+        let disk = e.dir.path().join("ext4.vhdx");
+        std::fs::write(&disk, b"vhdx").unwrap();
+        let script = compact_script_path();
+        let diskpart = format!("diskpart /s {}", script.display());
+        let sys = fake(0)
+            .respond("wsl --shutdown", Ok(""))
+            .respond(&diskpart, Ok("DiskPart successfully compacted the virtual disk file."))
+            .respond("docker builder prune -f", Ok(""));
+        let findings = [
+            dev("c", 4, true, Action::CompactDisk { path: disk.clone() }),
+            dev("d", 1, false, Action::DockerPrune { target: DockerTarget::BuildCache }),
+        ];
+
+        let report = exec(&e, &e.open, &sys, true).run(&findings, false);
+
+        assert_eq!(sys.calls(), vec!["docker builder prune -f".to_string(), "wsl --shutdown".into(), diskpart]);
+        assert_eq!(report.items[1].finding_id, "c");
+        assert_eq!(report.items[1].failed_count, 0);
+        assert!(!script.exists(), "temporary diskpart script is removed");
+    }
+
+    #[test]
+    fn compact_script_selects_attaches_compacts_and_detaches() {
+        let s = compact_script(Path::new("C:\\Users\\me\\ext4.vhdx"));
+        assert_eq!(
+            s,
+            "select vdisk file=\"C:\\Users\\me\\ext4.vhdx\"\r\nattach vdisk readonly\r\ncompact vdisk\r\ndetach vdisk\r\n"
+        );
+    }
+
+    #[test]
+    fn dry_run_runs_no_commands() {
+        let e = env();
+        let sys = fake(0);
+        let disk = e.dir.path().join("ext4.vhdx");
+        std::fs::write(&disk, b"vhdx").unwrap();
+        let findings = [
+            dev("d", 10, false, Action::DockerPrune { target: DockerTarget::Images }),
+            dev("v", 20, false, Action::DockerRemoveVolume { name: "x".into() }),
+            dev("t", 30, false, Action::RemoveToolchain { name: "x".into() }),
+            dev("c", 40, true, Action::CompactDisk { path: disk }),
+        ];
+
+        let report = exec(&e, &e.open, &sys, true).run(&findings, true);
+
+        assert!(sys.calls().is_empty());
+        assert_eq!(report.total_freed, 60, "compaction's size is only a maximum, so a dry run counts 0 for it");
+    }
+
+    #[test]
+    fn delete_paths_removes_folder_and_file_but_respects_the_guard() {
+        let e = env();
+        let avd = e.dir.path().join("avd");
+        file(&avd.join("Pixel.avd/userdata.img"), 70, 0);
+        file(&avd.join("Pixel.ini"), 5, 0);
+        file(&e.dir.path().join("Documents/keep.txt"), 1, 0);
+        let guard = ProtectedSet::new(vec![], vec![e.dir.path().join("Documents")]);
+        let f = dev("a", 75, false, Action::DeletePaths {
+            paths: vec![avd.join("Pixel.avd"), avd.join("Pixel.ini"), e.dir.path().join("Documents/keep.txt")],
+        });
+        let sys = fake(0);
+
+        let report = exec(&e, &guard, &sys, false).run(&[f], false);
+
+        assert!(!avd.join("Pixel.avd").exists() && !avd.join("Pixel.ini").exists());
+        assert!(e.dir.path().join("Documents/keep.txt").exists());
+        assert_eq!((report.total_freed, report.items[0].deleted_count, report.items[0].failed_count), (75, 2, 1));
     }
 
     #[test]
