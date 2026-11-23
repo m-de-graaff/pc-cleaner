@@ -1,3 +1,6 @@
+pub mod fsutil;
+pub mod journal;
+pub mod protect;
 pub mod model;
 pub mod scoring;
 
