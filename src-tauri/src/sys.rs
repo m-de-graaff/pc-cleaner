@@ -64,6 +64,11 @@ pub fn is_elevated() -> bool {
 
 /// Starts a new elevated copy of this exe through UAC. The caller exits the current process on Ok.
 pub fn relaunch_as_admin() -> Result<(), String> {
+    // Debug builds load the UI from the `tauri dev` server, which shuts down when this process
+    // exits, so the elevated copy would open a blank window.
+    if cfg!(debug_assertions) {
+        return Err("In development, close the app and run `pnpm tauri dev` from an administrator terminal instead.".into());
+    }
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy().replace('\'', "''");
@@ -98,6 +103,14 @@ mod tests {
     #[test]
     fn recycle_bin_query_does_not_panic() {
         let (_bytes, _items) = WindowsSys.recycle_bin_info();
+    }
+
+    #[test]
+    fn relaunch_is_refused_in_debug_builds() {
+        // Debug builds load the UI from the `tauri dev` server, which stops when this process exits,
+        // so an elevated relaunch would open a blank window. Also keeps tests from raising UAC.
+        let err = relaunch_as_admin().unwrap_err();
+        assert!(err.contains("administrator terminal"), "{err}");
     }
 
     #[test]
