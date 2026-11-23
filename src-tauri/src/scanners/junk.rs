@@ -273,6 +273,22 @@ mod tests {
         found.iter().find(|f| f.title == title).unwrap_or_else(|| panic!("no finding titled {title:?} in {:?}", titles(found)))
     }
 
+    /// Read-only timing of a scan of this machine's real junk locations.
+    /// Run with: cargo test --lib scan_this_machine -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn scan_this_machine() {
+        let p = KnownPaths::from_env().unwrap();
+        let now = SystemTime::now();
+        for l in junk_locations(&p) {
+            let t = std::time::Instant::now();
+            if let Some(f) = scan_location(&l, now) {
+                println!("{:>8.2}s  {:>10}  {:>9} files  {}", t.elapsed().as_secs_f64(), format_bytes(f.size_bytes), f.item_count, f.title);
+            }
+        }
+        println!("total: {:.2}s", now.elapsed().unwrap().as_secs_f64());
+    }
+
     #[test]
     fn developer_caches_are_found_and_need_review() {
         let dir = tempfile::tempdir().unwrap();
