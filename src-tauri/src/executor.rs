@@ -1,6 +1,6 @@
 use crate::fsutil::{candidates, old_dirs, unix_secs};
 use crate::journal::{Journal, JournalEntry};
-use crate::model::{Action, DockerTarget, Finding};
+use crate::model::{Action, DockerTarget, Finding, WslTask};
 use crate::protect::ProtectedSet;
 use crate::sys::SystemOps;
 use serde::Serialize;
@@ -66,7 +66,8 @@ fn path_size(path: &std::path::Path) -> u64 {
 
 impl Executor<'_> {
     pub fn run(&self, findings: &[Finding], dry_run: bool) -> ExecReport {
-        // Compaction goes last so space freed by Docker prunes in the same run is returned too.
+        // Compaction goes last so it returns the space freed by every other cleanup in the run,
+        // including Docker prunes and cleanups inside Linux.
         let mut ordered: Vec<&Finding> = findings.iter().collect();
         ordered.sort_by_key(|f| matches!(f.action, Action::CompactDisk { .. }));
         let items: Vec<ItemResult> = ordered
@@ -154,7 +155,19 @@ impl Executor<'_> {
             Action::RemoveToolchain { name } => {
                 self.run_command(&mut r, f, dry_run, "rustup", &["toolchain", "uninstall", name])
             }
+            Action::WslClean { distro, task } => {
+                let script = match task {
+                    WslTask::AptCache => "apt-get clean",
+                    WslTask::UserCaches => "find /root/.cache /home/*/.cache -mindepth 1 -delete 2>/dev/null; true",
+                    WslTask::Journal => "journalctl --vacuum-time=7d",
+                };
+                self.run_command(&mut r, f, dry_run, "wsl", &["-d", distro, "-u", "root", "--", "sh", "-c", script]);
+            }
             Action::CompactDisk { path } => {
+                if !path.exists() {
+                    r.skipped = Some("The disk no longer exists".into());
+                    return r;
+                }
                 if dry_run {
                     r.deleted_count = 1; // the size is only a maximum, so nothing is counted as freed
                     return r;
@@ -202,14 +215,15 @@ impl Executor<'_> {
     /// Run a tool for a finding. Freed space comes from docker's own report when present,
     /// otherwise from the scan's size.
     fn run_command(&self, r: &mut ItemResult, f: &Finding, dry_run: bool, program: &str, args: &[&str]) {
+        let expected = if f.upper_bound { 0 } else { f.size_bytes };
         if dry_run {
-            r.freed_bytes = f.size_bytes;
+            r.freed_bytes = expected;
             r.deleted_count = 1;
             return;
         }
         match self.sys.run(program, args) {
             Ok(out) => {
-                r.freed_bytes = reclaimed_from_docker(&out).unwrap_or(f.size_bytes);
+                r.freed_bytes = reclaimed_from_docker(&out).unwrap_or(expected);
                 r.deleted_count = 1;
             }
             Err(e) => {
@@ -237,6 +251,7 @@ impl Executor<'_> {
             Action::DockerRemoveVolume { .. } => "dockerRemoveVolume",
             Action::CompactDisk { .. } => "compactDisk",
             Action::RemoveToolchain { .. } => "removeToolchain",
+            Action::WslClean { .. } => "wslClean",
             Action::DeletePaths { .. } => "deletePaths",
         };
         let entry = JournalEntry {
@@ -261,7 +276,7 @@ impl Executor<'_> {
 mod tests {
     use super::*;
     use crate::fsutil::test_support::{age, file};
-    use crate::model::{Category, DockerTarget, NameFilter, Risk};
+    use crate::model::{Category, DockerTarget, NameFilter, Risk, WslTask};
     use crate::sys::fake::FakeSys;
     use std::path::Path;
 
@@ -390,6 +405,46 @@ mod tests {
         assert_eq!(report.items[1].finding_id, "c");
         assert_eq!(report.items[1].failed_count, 0);
         assert!(!script.exists(), "temporary diskpart script is removed");
+    }
+
+    #[test]
+    fn linux_cleanups_run_before_compaction() {
+        let e = env();
+        let disk = e.dir.path().join("ext4.vhdx");
+        std::fs::write(&disk, b"vhdx").unwrap();
+        let diskpart = format!("diskpart /s {}", compact_script_path().display());
+        let apt = "wsl -d Ubuntu -u root -- sh -c apt-get clean";
+        let caches = "wsl -d Ubuntu -u root -- sh -c find /root/.cache /home/*/.cache -mindepth 1 -delete 2>/dev/null; true";
+        let journal = "wsl -d Ubuntu -u root -- sh -c journalctl --vacuum-time=7d";
+        let sys = fake(0)
+            .respond(apt, Ok(""))
+            .respond(caches, Ok(""))
+            .respond(journal, Ok(""))
+            .respond("wsl --shutdown", Ok(""))
+            .respond(&diskpart, Ok(""));
+        let findings = [
+            dev("c", 4, true, Action::CompactDisk { path: disk }),
+            dev("a", 10, false, Action::WslClean { distro: "Ubuntu".into(), task: WslTask::AptCache }),
+            dev("h", 20, false, Action::WslClean { distro: "Ubuntu".into(), task: WslTask::UserCaches }),
+            Finding { upper_bound: true, ..dev("j", 30, false, Action::WslClean { distro: "Ubuntu".into(), task: WslTask::Journal }) },
+        ];
+
+        let report = exec(&e, &e.open, &sys, true).run(&findings, false);
+
+        assert_eq!(sys.calls(), vec![apt, caches, journal, "wsl --shutdown", diskpart.as_str()]);
+        assert_eq!(report.total_freed, 30, "journal size is only a maximum, so it isn't counted");
+    }
+
+    #[test]
+    fn compaction_of_a_removed_disk_is_skipped() {
+        let e = env();
+        let sys = fake(0);
+        let f = dev("c", 4, true, Action::CompactDisk { path: e.dir.path().join("gone.vhdx") });
+
+        let report = exec(&e, &e.open, &sys, true).run(&[f], false);
+
+        assert_eq!(report.items[0].skipped.as_deref(), Some("The disk no longer exists"));
+        assert!(sys.calls().is_empty());
     }
 
     #[test]

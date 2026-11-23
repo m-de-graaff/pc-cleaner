@@ -92,19 +92,22 @@ A separate "Dev tools" page that uses the same scan → review → clean flow, g
 | Stopped Docker containers | `docker system df` "Containers" reclaimable | `docker container prune -f` | review | no |
 | Unused Docker volume `<name>`, one per volume | `docker volume ls -q --filter dangling=true`, sizes from `docker system df -v` | `docker volume rm <name>` | caution | no |
 | Compact WSL disk `<name>` | `ext4.vhdx`/`docker_data.vhdx` under `%LOCALAPPDATA%\Packages\*\LocalState`, `%LOCALAPPDATA%\Docker\wsl\*`, `%LOCALAPPDATA%\wsl\*` | `wsl --shutdown`, then `diskpart` `compact vdisk` | review | yes |
+| apt package cache `(<distro>)` | `du` inside each distro listed under `HKCU\…\Lxss`, except `docker-desktop*` | `wsl -d <distro> -u root -- sh -c "apt-get clean"` | safe | no |
+| User caches in `~/.cache` `(<distro>)` | same | delete the contents of `/root/.cache` and `/home/*/.cache` | review | no |
+| System logs older than 7 days `(<distro>)`, size shown as "up to" | same | `journalctl --vacuum-time=7d` | review | no |
 | Rust toolchain `<name>`, except the default and active ones | `rustup toolchain list` | `rustup toolchain uninstall <name>` | review | no |
 | Android emulator `<name>` | `%ANDROID_AVD_HOME%` or `~\.android\avd\*.avd` plus its `.ini` | delete both | caution | no |
 | JetBrains IDE caches | `%LOCALAPPDATA%\JetBrains\<product>\caches` (junk scanner) | delete contents | safe | no |
 
 - **Docker not running.** The page shows a notice telling you to start Docker Desktop, and lists no Docker findings.
 - **Sizes for disk compaction are an upper bound.** The finding shows the disk file's size ("up to"), and that size is left out of the selected total. The real result is measured from the file size before and after compacting.
-- **Order of execution.** The executor always runs compaction last, so space freed by Docker prunes in the same run is returned to Windows.
+- **Order of execution.** The executor always runs compaction last, so space freed by Docker prunes and cleanups inside Linux in the same run is returned to Windows. Compacting a disk that no longer exists is skipped.
+- **Scanning starts the distros.** A Dev tools scan briefly starts each WSL distro to measure its caches with `du`. A distro that fails to start is skipped.
 - **Confirmation warning.** The dialog warns that compaction shuts down WSL and Docker.
 
 Left out on purpose:
-- Unregistering WSL distros: that removes a whole Linux install, so it belongs with uninstall in piece 3.
+- Removing WSL distros (`wsl --unregister`): left out at the user's request, in this piece and in piece 3. The app never deletes a Linux install.
 - `ProgramData\Package Cache`: deleting it breaks repair and uninstall for installed apps.
-- Cleaning inside Linux.
 
 ### Piece 2 — Old dev projects + large/duplicate files (needs piece 1)
 

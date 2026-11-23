@@ -40,7 +40,7 @@ export default function App() {
           {page === "devtools" && (
             <ReviewPage
               title="Dev tools"
-              intro="Docker data, WSL disks that can be compacted, Rust toolchains you don't use by default, and Android emulators."
+              intro="Docker data, WSL disks that can be compacted, caches inside your Linux distros, Rust toolchains you don't use by default, and Android emulators. Scanning briefly starts your WSL distros to measure them."
               scan={devtools}
               elevated={elevated}
               onCleaned={refreshInfo}

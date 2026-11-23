@@ -10,6 +10,7 @@ export type Action =
   | { kind: "dockerRemoveVolume"; name: string }
   | { kind: "compactDisk"; path: string }
   | { kind: "removeToolchain"; name: string }
+  | { kind: "wslClean"; distro: string; task: "aptCache" | "userCaches" | "journal" }
   | { kind: "deletePaths"; paths: string[] };
 
 export interface Finding {

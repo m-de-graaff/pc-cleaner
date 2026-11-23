@@ -16,6 +16,15 @@ pub enum DockerTarget {
     Containers,
 }
 
+/// Cleanups run inside a WSL distro as root. Each maps to one fixed command in the executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WslTask {
+    AptCache,
+    UserCaches,
+    Journal,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Risk {
@@ -57,6 +66,7 @@ pub enum Action {
     /// Shut down WSL and compact this virtual disk so space freed inside it returns to Windows.
     CompactDisk { path: PathBuf },
     RemoveToolchain { name: String },
+    WslClean { distro: String, task: WslTask },
     /// Delete these files or folders (folders recursively).
     DeletePaths { paths: Vec<PathBuf> },
 }
@@ -113,5 +123,6 @@ mod tests {
         assert_eq!(serde_json::to_value(Action::RemoveToolchain { name: "1.85".into() }).unwrap()["kind"], "removeToolchain");
         assert_eq!(serde_json::to_value(Action::DeletePaths { paths: vec![] }).unwrap()["kind"], "deletePaths");
         assert_eq!(serde_json::to_value(Category::DevTools).unwrap(), "devtools");
-    }
+        let clean = serde_json::to_value(Action::WslClean { distro: "Ubuntu".into(), task: WslTask::AptCache }).unwrap();
+        assert_eq!((clean["kind"].as_str(), clean["task"].as_str()), (Some("wslClean"), Some("aptCache")));    }
 }

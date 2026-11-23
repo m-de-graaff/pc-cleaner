@@ -3,7 +3,7 @@
 
 use super::junk::KnownPaths;
 use crate::fsutil::{summarize, unix_secs};
-use crate::model::{Action, Category, DockerTarget, Finding, NameFilter, Risk};
+use crate::model::{Action, Category, DockerTarget, Finding, NameFilter, Risk, WslTask};
 use crate::scoring::{format_bytes, score};
 use crate::sys::SystemOps;
 use serde::Serialize;
@@ -219,11 +219,105 @@ pub fn avd_findings(p: &KnownPaths, now: SystemTime) -> Vec<Finding> {
         .collect()
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct Distro {
+    pub name: String,
+    pub vhdx: PathBuf,
+}
+
+/// Distros from `reg query HKCU\...\Lxss /s`: one block per distro GUID with
+/// DistributionName, BasePath and VhdFileName, separated by four spaces.
+pub fn parse_lxss(reg_output: &str) -> Vec<Distro> {
+    let mut distros = Vec::new();
+    let mut block: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut flush = |block: &mut std::collections::HashMap<String, String>| {
+        if let (Some(name), Some(base)) = (block.get("DistributionName"), block.get("BasePath")) {
+            let base = base.strip_prefix("\\\\?\\").unwrap_or(base);
+            let file = block.get("VhdFileName").map_or("ext4.vhdx", String::as_str);
+            distros.push(Distro { name: name.clone(), vhdx: Path::new(base).join(file) });
+        }
+        block.clear();
+    };
+    for line in reg_output.lines() {
+        if line.starts_with("HKEY_") {
+            flush(&mut block);
+            continue;
+        }
+        let parts: Vec<&str> = line.trim().splitn(3, "    ").collect();
+        if let [key, _kind, value] = parts[..] {
+            block.insert(key.to_string(), value.trim().to_string());
+        }
+    }
+    flush(&mut block);
+    distros
+}
+
+const INSIDE_WHY: &str = "This frees space inside Linux. Compact the distro's disk afterwards to give it back to Windows.";
+const LINUX_SIZES: &str = "du -sb /var/cache/apt/archives /var/log/journal /root/.cache /home/*/.cache 2>/dev/null; true";
+
+fn linux_findings(sys: &dyn SystemOps, distro: &str) -> Vec<Finding> {
+    let Ok(out) = sys.run("wsl", &["-d", distro, "-u", "root", "--", "sh", "-c", LINUX_SIZES]) else { return Vec::new() };
+    let (mut apt, mut journal, mut caches) = (0u64, 0u64, 0u64);
+    for line in out.lines() {
+        let Some((bytes, path)) = line.split_once('\t') else { continue };
+        let Ok(bytes) = bytes.trim().parse::<u64>() else { continue };
+        match path.trim() {
+            "/var/cache/apt/archives" => apt += bytes,
+            "/var/log/journal" => journal += bytes,
+            p if p.ends_with("/.cache") => caches += bytes,
+            _ => {}
+        }
+    }
+    let make = |task: WslTask, title: &str, size: u64, risk: Risk, why: &str| {
+        dev_finding(
+            format!("devtools:wsl-clean:{}:{}", distro.to_lowercase(), serde_json::to_value(task).unwrap().as_str().unwrap()),
+            format!("{title} ({distro})"),
+            size,
+            risk,
+            format!("{}. {why} {INSIDE_WHY}", format_bytes(size)),
+            Action::WslClean { distro: distro.into(), task },
+        )
+    };
+    let mut v = Vec::new();
+    if apt > 0 {
+        v.push(make(WslTask::AptCache, "apt package cache", apt, Risk::Safe, "Downloaded .deb packages that are already installed."));
+    }
+    if caches > 0 {
+        v.push(make(
+            WslTask::UserCaches,
+            "User caches in ~/.cache",
+            caches,
+            Risk::Review,
+            "Caches of Linux tools (pip, npm, browsers for tests and more). They rebuild when needed, but a few tools keep state here.",
+        ));
+    }
+    if journal > 0 {
+        v.push(Finding {
+            upper_bound: true,
+            ..make(WslTask::Journal, "System logs older than 7 days", journal, Risk::Review, "The systemd journal. This is its total size; only entries older than 7 days are removed.")
+        });
+    }
+    v
+}
+
+/// Cleanups inside each WSL distro, except Docker Desktop's own, which Docker manages.
+pub fn distro_findings(sys: &dyn SystemOps) -> Vec<Finding> {
+    let Ok(reg) = sys.run("reg", &["query", "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss", "/s"]) else {
+        return Vec::new();
+    };
+    parse_lxss(&reg)
+        .into_iter()
+        .filter(|d| !d.name.starts_with("docker-desktop"))
+        .flat_map(|d| linux_findings(sys, &d.name))
+        .collect()
+}
+
 pub fn scan_devtools(p: &KnownPaths, sys: &dyn SystemOps, now: SystemTime) -> DevScan {
     let (mut findings, notices) = docker_findings(sys);
     findings.extend(wsl_disk_findings(p));
     findings.extend(toolchain_findings(p, sys));
     findings.extend(avd_findings(p, now));
+    findings.extend(distro_findings(sys));
     findings.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
     DevScan { findings, notices }
 }
@@ -380,6 +474,66 @@ mod tests {
         sorted.sort_by(|a, b| b.cmp(a));
         assert_eq!(scores, sorted);
         find(&scan.findings, "Android emulator: a");
+    }
+
+    const LXSS: &str = "reg query HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss /s";
+    const LXSS_OUT: &str = "\r
+HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\r
+    DefaultDistribution    REG_SZ    {cf6264aa}\r
+\r
+HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{c3091a87}\r
+    DistributionName    REG_SZ    docker-desktop\r
+    BasePath    REG_SZ    \\\\?\\C:\\Users\\me\\AppData\\Local\\Docker\\wsl\\main\r
+    VhdFileName    REG_SZ    ext4.vhdx\r
+\r
+HKEY_CURRENT_USER\\Software\\Microsoft\\Windows\\CurrentVersion\\Lxss\\{cf6264aa}\r
+    DistributionName    REG_SZ    Ubuntu\r
+    BasePath    REG_SZ    C:\\Users\\me\\My Distros\\Ubuntu\r
+    VhdFileName    REG_SZ    ext4.vhdx\r
+";
+    const DU_UBUNTU: &str = "wsl -d Ubuntu -u root -- sh -c du -sb /var/cache/apt/archives /var/log/journal /root/.cache /home/*/.cache 2>/dev/null; true";
+    const DU_OUT: &str = "122947714\t/var/cache/apt/archives\n838860800\t/var/log/journal\n0\t/root/.cache\n19771815841\t/home/mark/.cache\n";
+
+    #[test]
+    fn parses_wsl_distros_from_the_registry() {
+        assert_eq!(
+            parse_lxss(LXSS_OUT),
+            vec![
+                Distro { name: "docker-desktop".into(), vhdx: PathBuf::from("C:\\Users\\me\\AppData\\Local\\Docker\\wsl\\main\\ext4.vhdx") },
+                Distro { name: "Ubuntu".into(), vhdx: PathBuf::from("C:\\Users\\me\\My Distros\\Ubuntu\\ext4.vhdx") },
+            ]
+        );
+    }
+
+    #[test]
+    fn user_distros_are_cleaned_inside_but_never_removed() {
+        let sys = FakeSys::default().respond(LXSS, Ok(LXSS_OUT)).respond(DU_UBUNTU, Ok(DU_OUT));
+
+        let found = distro_findings(&sys);
+
+        assert_eq!(found.len(), 3);
+        assert!(found.iter().all(|f| matches!(f.action, Action::WslClean { .. })));
+        assert!(!sys.calls().iter().any(|c| c.contains("docker-desktop")), "Docker's own distros are never touched");
+
+        let apt = find(&found, "apt package cache (Ubuntu)");
+        assert_eq!((apt.size_bytes, apt.risk), (122_947_714, Risk::Safe));
+        assert_eq!(apt.action, Action::WslClean { distro: "Ubuntu".into(), task: WslTask::AptCache });
+        let caches = find(&found, "User caches in ~/.cache (Ubuntu)");
+        assert_eq!((caches.size_bytes, caches.risk), (19_771_815_841, Risk::Review));
+        let logs = find(&found, "System logs older than 7 days (Ubuntu)");
+        assert!(logs.upper_bound);
+        assert!(apt.reason.contains("Compact the distro's disk"), "{}", apt.reason);
+    }
+
+    #[test]
+    fn distro_that_fails_to_start_is_skipped() {
+        let sys = FakeSys::default().respond(LXSS, Ok(LXSS_OUT)).respond(DU_UBUNTU, Err("distro failed to start"));
+        assert!(distro_findings(&sys).is_empty());
+    }
+
+    #[test]
+    fn no_wsl_means_no_distro_findings() {
+        assert!(distro_findings(&FakeSys::default()).is_empty());
     }
 
     /// Read-only: prints what the scan finds on this machine. Cleans nothing.
