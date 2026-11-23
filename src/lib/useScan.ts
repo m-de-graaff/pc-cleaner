@@ -1,12 +1,13 @@
 import { listen } from "@tauri-apps/api/event";
 import { useCallback, useEffect, useState } from "react";
-import { api } from "./api";
-import type { Finding, ScanProgress } from "./types";
+import type { Finding, ScanProgress, ScanResult } from "./types";
 
 export type ScanStatus = "idle" | "scanning" | "done" | "error";
 
-export interface JunkScan {
+export interface Scan {
   findings: Finding[];
+  /** Messages that aren't findings, e.g. "Docker isn't running". */
+  notices: string[];
   status: ScanStatus;
   error: string | null;
   /** Latest progress event while scanning; null before the first location finishes. */
@@ -14,8 +15,9 @@ export interface JunkScan {
   scan: () => Promise<void>;
 }
 
-export function useJunkScan(): JunkScan {
-  const [findings, setFindings] = useState<Finding[]>([]);
+/** Scan state for one page. `fetch` runs the backend scan. */
+export function useScan(fetch: () => Promise<ScanResult>): Scan {
+  const [result, setResult] = useState<ScanResult>({ findings: [], notices: [] });
   const [status, setStatus] = useState<ScanStatus>("idle");
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState<ScanProgress | null>(null);
@@ -32,13 +34,13 @@ export function useJunkScan(): JunkScan {
     setError(null);
     setProgress(null);
     try {
-      setFindings(await api.scanJunk());
+      setResult(await fetch());
       setStatus("done");
     } catch (e) {
       setError(String(e));
       setStatus("error");
     }
-  }, []);
+  }, [fetch]);
 
-  return { findings, status, error, progress, scan };
+  return { ...result, status, error, progress, scan };
 }

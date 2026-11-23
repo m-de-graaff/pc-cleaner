@@ -1,10 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { defaultSelection, groupByRisk, isSelectable, selectedTotal } from "./selection";
+import { confirmNotes, defaultSelection, groupByRisk, isSelectable, selectedTotal } from "./selection";
 import type { Finding, Risk } from "./types";
 
 const f = (id: string, risk: Risk, sizeBytes: number, requiresAdmin = false): Finding => ({
   id, risk, sizeBytes, requiresAdmin,
-  category: "junk", title: id, itemCount: 1, lastModified: null, score: 50, reason: "", reversible: false,
+  category: "junk", title: id, itemCount: 1, lastModified: null, score: 50, reason: "", reversible: false, upperBound: false,
   action: { kind: "emptyRecycleBin" },
 });
 
@@ -24,6 +24,20 @@ describe("selection", () => {
   it("totals selected sizes", () => {
     expect(selectedTotal(items, new Set(["a", "b"]))).toBe(300);
     expect(selectedTotal(items, new Set())).toBe(0);
+  });
+
+  it("leaves upper-bound sizes out of the total", () => {
+    const disk: Finding = { ...f("w", "review", 5000), upperBound: true, action: { kind: "compactDisk", path: "C:\\x.vhdx" } };
+    expect(selectedTotal([...items, disk], new Set(["a", "w"]))).toBe(100);
+  });
+
+  it("warns about WSL shutdown and permanent data loss only when relevant", () => {
+    const disk: Finding = { ...f("w", "review", 1), action: { kind: "compactDisk", path: "C:\\x.vhdx" } };
+    const vol: Finding = { ...f("v", "caution", 1), action: { kind: "dockerRemoveVolume", name: "pg" } };
+    const all = [...items, disk, vol];
+    expect(confirmNotes(all, new Set(["a"]))).toEqual([]);
+    expect(confirmNotes(all, new Set(["w"]))[0]).toMatch(/shuts down WSL/);
+    expect(confirmNotes(all, new Set(["v", "w"]))).toHaveLength(2);
   });
 
   it("groups by risk in a fixed order", () => {

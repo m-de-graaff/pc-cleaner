@@ -1,10 +1,11 @@
-import { History, LayoutDashboard, Trash2 } from "lucide-react";
+import { Container, History, LayoutDashboard, Trash2 } from "lucide-react";
 
-export type Page = "dashboard" | "junk" | "history";
+export type Page = "dashboard" | "junk" | "devtools" | "history";
 
 const ITEMS = [
   { id: "dashboard", label: "Overview", icon: LayoutDashboard },
   { id: "junk", label: "Junk & temp files", icon: Trash2 },
+  { id: "devtools", label: "Dev tools", icon: Container },
   { id: "history", label: "History", icon: History },
 ] as const;
 

@@ -31,7 +31,7 @@ export function FindingRow({ finding: f, checked, disabled, onToggle }: Props) {
               <AlertTriangle size={12} aria-hidden="true" /> Can't be undone
             </span>
           )}
-          <span className="ml-auto tabular-nums text-zinc-300">{formatBytes(f.sizeBytes)}</span>
+          <span className="ml-auto tabular-nums text-zinc-300">{f.upperBound && "up to "}{formatBytes(f.sizeBytes)}</span>
         </span>
         <span id={`${id}-reason`} className="mt-1 block text-sm text-zinc-400">{f.reason}</span>
       </label>

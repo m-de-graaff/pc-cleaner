@@ -1,14 +1,14 @@
 import { HardDrive, Loader2, Sparkles } from "lucide-react";
 import { formatBytes, progressLabel } from "../lib/format";
 import type { SystemInfo } from "../lib/types";
-import type { JunkScan } from "../lib/useJunkScan";
+import type { Scan } from "../lib/useScan";
 
 const primary =
   "inline-flex items-center gap-2 rounded-lg bg-sky-500 px-4 py-2 font-medium text-zinc-950 hover:bg-sky-400 disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-300";
 const secondary =
   "inline-flex items-center gap-2 rounded-lg border border-zinc-700 px-4 py-2 text-zinc-200 hover:bg-zinc-800 disabled:opacity-60 focus-visible:outline-2 focus-visible:outline-sky-400";
 
-export function Dashboard({ info, scan, onReview }: { info: SystemInfo | null; scan: JunkScan; onReview: () => void }) {
+export function Dashboard({ info, scan, onReview }: { info: SystemInfo | null; scan: Scan; onReview: () => void }) {
   const drive = info?.drive;
   const usedPct = drive ? Math.round(((drive.totalBytes - drive.freeBytes) / drive.totalBytes) * 100) : 0;
   const total = scan.findings.reduce((s, f) => s + f.sizeBytes, 0);

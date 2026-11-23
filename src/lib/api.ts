@@ -1,8 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { ExecReport, Finding, JournalEntry, SystemInfo } from "./types";
+import type { ExecReport, Finding, JournalEntry, ScanResult, SystemInfo } from "./types";
 
 export const api = {
-  scanJunk: () => invoke<Finding[]>("scan_junk"),
+  scanJunk: async (): Promise<ScanResult> => ({ findings: await invoke<Finding[]>("scan_junk"), notices: [] }),
+  scanDevtools: () => invoke<ScanResult>("scan_devtools"),
   clean: (ids: string[], dryRun: boolean) => invoke<ExecReport>("clean", { ids, dryRun }),
   history: () => invoke<JournalEntry[]>("history"),
   systemInfo: () => invoke<SystemInfo>("system_info"),

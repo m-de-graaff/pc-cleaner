@@ -1,11 +1,16 @@
 export type Risk = "safe" | "review" | "caution";
-export type Category = "junk";
+export type Category = "junk" | "devtools";
 
 export interface NameFilter { prefix: string | null; suffix: string | null }
 
 export type Action =
   | { kind: "deleteContents"; root: string; filter: NameFilter; minAgeHours: number }
-  | { kind: "emptyRecycleBin" };
+  | { kind: "emptyRecycleBin" }
+  | { kind: "dockerPrune"; target: "buildCache" | "images" | "containers" }
+  | { kind: "dockerRemoveVolume"; name: string }
+  | { kind: "compactDisk"; path: string }
+  | { kind: "removeToolchain"; name: string }
+  | { kind: "deletePaths"; paths: string[] };
 
 export interface Finding {
   id: string;
@@ -19,8 +24,12 @@ export interface Finding {
   reason: string;
   requiresAdmin: boolean;
   reversible: boolean;
+  /** sizeBytes is a maximum (disk compaction); left out of totals. */
+  upperBound: boolean;
   action: Action;
 }
+
+export interface ScanResult { findings: Finding[]; notices: string[] }
 
 export interface ItemResult {
   findingId: string;

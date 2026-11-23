@@ -27,6 +27,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::scan_junk,
+            commands::scan_devtools,
             commands::clean,
             commands::history,
             commands::system_info,

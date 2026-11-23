@@ -2,6 +2,7 @@ use crate::executor::{ExecReport, Executor};
 use crate::journal::{Journal, JournalEntry};
 use crate::model::{Category, Finding};
 use crate::protect::ProtectedSet;
+use crate::scanners::devtools::{scan_devtools as run_devtools_scan, DevScan};
 use crate::scanners::junk::{scan_junk_with_progress, KnownPaths};
 use crate::sys::{self, DriveUsage, WindowsSys};
 use serde::Serialize;
@@ -37,14 +38,36 @@ pub async fn scan_junk(app: AppHandle) -> Result<Vec<Finding>, String> {
         let findings = scan_junk_with_progress(&paths, &WindowsSys, SystemTime::now(), &|progress| {
             let _ = app.emit("scan-progress", progress); // progress is cosmetic; a dropped event is harmless
         });
-        let state = app.state::<AppState>();
-        let mut scan = state.last_scan.lock().map_err(|_| "Scan state is unavailable.")?;
-        scan.retain(|_, f| f.category != Category::Junk);
-        scan.extend(findings.iter().map(|f| (f.id.clone(), f.clone())));
+        remember(&app, Category::Junk, &findings)?;
         Ok::<_, String>(findings)
     })
     .await
     .map_err(|e| e.to_string())?
+}
+
+#[tauri::command]
+pub async fn scan_devtools(app: AppHandle) -> Result<DevScan, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let paths = KnownPaths::from_env().ok_or("Windows environment folders are missing.")?;
+        let scan = run_devtools_scan(&paths, &WindowsSys, SystemTime::now());
+        remember(&app, Category::DevTools, &scan.findings)?;
+        Ok::<_, String>(scan)
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+fn remember(app: &AppHandle, category: Category, findings: &[Finding]) -> Result<(), String> {
+    let state = app.state::<AppState>();
+    let mut scan = state.last_scan.lock().map_err(|_| "Scan state is unavailable.")?;
+    replace_category(&mut scan, category, findings);
+    Ok(())
+}
+
+/// A new scan of one page replaces only that page's findings, so the other page can still clean.
+pub fn replace_category(scan: &mut HashMap<String, Finding>, category: Category, findings: &[Finding]) {
+    scan.retain(|_, f| f.category != category);
+    scan.extend(findings.iter().map(|f| (f.id.clone(), f.clone())));
 }
 
 #[tauri::command]
@@ -98,6 +121,18 @@ mod tests {
         let f = recycle_bin_finding(10, 1).unwrap();
         let scan = HashMap::from([(f.id.clone(), f.clone())]);
         assert_eq!(select_findings(&scan, &[f.id.clone()]).unwrap(), vec![f]);
+    }
+
+    #[test]
+    fn rescanning_one_page_keeps_the_other_pages_findings() {
+        let junk = recycle_bin_finding(10, 1).unwrap();
+        let dev = Finding { id: "devtools:x".into(), category: Category::DevTools, ..junk.clone() };
+        let mut scan = HashMap::new();
+        replace_category(&mut scan, Category::Junk, &[junk.clone()]);
+        replace_category(&mut scan, Category::DevTools, &[dev.clone()]);
+        replace_category(&mut scan, Category::DevTools, &[]);
+        assert!(scan.contains_key(&junk.id));
+        assert!(!scan.contains_key(&dev.id));
     }
 
     #[test]
