@@ -18,7 +18,7 @@ pub struct KnownPaths {
 }
 
 /// Environment variables developer tools use to move their caches.
-const OVERRIDE_VARS: [&str; 8] = [
+const OVERRIDE_VARS: [&str; 9] = [
     "CARGO_HOME",
     "RUSTUP_HOME",
     "npm_config_cache",
@@ -27,6 +27,7 @@ const OVERRIDE_VARS: [&str; 8] = [
     "UV_CACHE_DIR",
     "GRADLE_USER_HOME",
     "YARN_CACHE_FOLDER",
+    "ANDROID_AVD_HOME",
 ];
 
 impl KnownPaths {
@@ -44,7 +45,7 @@ impl KnownPaths {
     }
 
     /// `env[var]` if the tool's override is set, otherwise `default`.
-    fn tool_dir(&self, var: &str, default: PathBuf) -> PathBuf {
+    pub(crate) fn tool_dir(&self, var: &str, default: PathBuf) -> PathBuf {
         self.env.get(var).cloned().unwrap_or(default)
     }
 }
@@ -73,7 +74,7 @@ fn loc(title: impl Into<String>, root: PathBuf, min_age_hours: u64, risk: Risk, 
 }
 
 /// Child folders of `base` that contain `sub`, as (child name, base/child/sub), sorted by name.
-fn profiles(base: &Path, sub: &str) -> Vec<(String, PathBuf)> {
+pub(crate) fn profiles(base: &Path, sub: &str) -> Vec<(String, PathBuf)> {
     let Ok(entries) = std::fs::read_dir(base) else { return Vec::new() };
     let mut out: Vec<(String, PathBuf)> = entries
         .filter_map(Result::ok)
@@ -184,6 +185,9 @@ fn app_locations(p: &KnownPaths) -> Vec<JunkLocation> {
     }
     v.push(safe("VS Code extension downloads".into(), p.app_data.join("Code\\CachedExtensionVSIXs"), APP_CACHE_WHY));
     v.push(safe("Spotify cache".into(), p.local_app_data.join("Spotify\\Data"), APP_CACHE_WHY));
+    for (product, root) in profiles(&p.local_app_data.join("JetBrains"), "caches") {
+        v.push(safe(format!("JetBrains cache ({product})"), root, APP_CACHE_WHY));
+    }
     v.push(safe("Internet cache".into(), p.local_app_data.join("Microsoft\\Windows\\INetCache"), APP_CACHE_WHY));
     v.push(safe("DirectX shader cache".into(), p.local_app_data.join("D3DSCache"), SHADER_WHY));
     v.push(safe("NVIDIA DirectX shader cache".into(), p.local_app_data.join("NVIDIA\\DXCache"), SHADER_WHY));
@@ -378,6 +382,15 @@ mod tests {
         let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
         assert_eq!(find(&found, "VS Code cache (CachedData)").risk, Risk::Safe);
         assert_eq!(find(&found, "DirectX shader cache").risk, Risk::Safe);
+    }
+
+    #[test]
+    fn jetbrains_caches_are_safe_per_product() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_paths(dir.path());
+        file(&p.local_app_data.join("JetBrains/IntelliJIdea2026.2/caches/content.dat"), 10, 0);
+        let found = scan_junk(&p, &FakeSys::with_bin(0, 0), SystemTime::now());
+        assert_eq!(find(&found, "JetBrains cache (IntelliJIdea2026.2)").risk, Risk::Safe);
     }
 
     #[test]
