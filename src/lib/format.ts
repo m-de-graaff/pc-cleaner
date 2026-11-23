@@ -1,4 +1,11 @@
+import type { ScanProgress } from "./types";
+
 const UNITS = ["B", "KB", "MB", "GB", "TB"];
+
+export function progressLabel(p: ScanProgress | null): string {
+  if (!p) return "Scanning…";
+  return `Scanning… ${p.done} of ${p.total} checked (${p.title})`;
+}
 
 export function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;

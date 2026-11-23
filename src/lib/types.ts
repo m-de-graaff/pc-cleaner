@@ -46,5 +46,7 @@ export interface JournalEntry {
   reversible: boolean;
 }
 
+export interface ScanProgress { done: number; total: number; title: string }
+
 export interface DriveUsage { root: string; totalBytes: number; freeBytes: number }
 export interface SystemInfo { elevated: boolean; drive: DriveUsage | null }

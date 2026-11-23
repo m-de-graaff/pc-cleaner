@@ -3,7 +3,7 @@ import { useEffect, useState } from "react";
 import { ConfirmDialog } from "../components/ConfirmDialog";
 import { FindingRow } from "../components/FindingRow";
 import { api } from "../lib/api";
-import { formatBytes } from "../lib/format";
+import { formatBytes, progressLabel } from "../lib/format";
 import { defaultSelection, groupByRisk, isSelectable, RISK_ORDER, selectedTotal } from "../lib/selection";
 import type { ExecReport, Risk } from "../lib/types";
 import type { JunkScan } from "../lib/useJunkScan";
@@ -75,7 +75,7 @@ export function JunkPage({ scan, elevated, onCleaned }: Props) {
 
       {scan.status === "scanning" && (
         <p role="status" className="flex items-center gap-2 text-zinc-400">
-          <Loader2 size={16} className="animate-spin" aria-hidden="true" /> Scanning…
+          <Loader2 size={16} className="animate-spin" aria-hidden="true" /> {progressLabel(scan.progress)}
         </p>
       )}
       {scan.error && <p role="alert" className="text-red-400">The scan failed: {scan.error}</p>}

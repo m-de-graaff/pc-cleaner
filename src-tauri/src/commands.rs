@@ -2,13 +2,13 @@ use crate::executor::{ExecReport, Executor};
 use crate::journal::{Journal, JournalEntry};
 use crate::model::{Category, Finding};
 use crate::protect::ProtectedSet;
-use crate::scanners::junk::{scan_junk as run_junk_scan, KnownPaths};
+use crate::scanners::junk::{scan_junk_with_progress, KnownPaths};
 use crate::sys::{self, DriveUsage, WindowsSys};
 use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::SystemTime;
-use tauri::{AppHandle, Manager};
+use tauri::{AppHandle, Emitter, Manager};
 
 pub struct AppState {
     pub last_scan: Mutex<HashMap<String, Finding>>,
@@ -34,7 +34,9 @@ pub fn select_findings(scan: &HashMap<String, Finding>, ids: &[String]) -> Resul
 pub async fn scan_junk(app: AppHandle) -> Result<Vec<Finding>, String> {
     tauri::async_runtime::spawn_blocking(move || {
         let paths = KnownPaths::from_env().ok_or("Windows environment folders are missing.")?;
-        let findings = run_junk_scan(&paths, &WindowsSys, SystemTime::now());
+        let findings = scan_junk_with_progress(&paths, &WindowsSys, SystemTime::now(), &|progress| {
+            let _ = app.emit("scan-progress", progress); // progress is cosmetic; a dropped event is harmless
+        });
         let state = app.state::<AppState>();
         let mut scan = state.last_scan.lock().map_err(|_| "Scan state is unavailable.")?;
         scan.retain(|_, f| f.category != Category::Junk);

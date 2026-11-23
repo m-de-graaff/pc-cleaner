@@ -1,5 +1,5 @@
 import { HardDrive, Loader2, Sparkles } from "lucide-react";
-import { formatBytes } from "../lib/format";
+import { formatBytes, progressLabel } from "../lib/format";
 import type { SystemInfo } from "../lib/types";
 import type { JunkScan } from "../lib/useJunkScan";
 
@@ -59,7 +59,9 @@ export function Dashboard({ info, scan, onReview }: { info: SystemInfo | null; s
           </div>
         ) : (
           <div className="flex items-center gap-4">
-            <p className="flex-1 text-zinc-300">Find temporary files, caches and other junk that's safe to remove.</p>
+            <p className="flex-1 text-zinc-300" role={scanning ? "status" : undefined}>
+              {scanning ? progressLabel(scan.progress) : "Find temporary files, caches and other junk that's safe to remove."}
+            </p>
             <button type="button" className={primary} disabled={scanning} onClick={scan.scan}>
               {scanning ? <Loader2 size={16} className="animate-spin" aria-hidden="true" /> : <Sparkles size={16} aria-hidden="true" />}
               {scanning ? "Scanning…" : "Scan now"}

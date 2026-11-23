@@ -39,13 +39,46 @@ pub fn candidates(root: &Path, filter: &NameFilter, min_age: Duration, now: Syst
         .collect()
 }
 
+/// Same selection as `candidates`, but only totals it, walking subfolders in parallel.
+/// Caches like uv or the pnpm store hold hundreds of thousands of files, so a single-threaded
+/// walk of one of them dominates the whole scan.
 pub fn summarize(root: &Path, filter: &NameFilter, min_age: Duration, now: SystemTime) -> Stats {
-    candidates(root, filter, min_age, now).into_iter().fold(Stats::default(), |mut s, c| {
-        s.bytes += c.size;
-        s.files += 1;
-        s.newest = Some(s.newest.map_or(c.modified, |n| n.max(c.modified)));
-        s
-    })
+    use rayon::prelude::*;
+
+    let Ok(entries) = std::fs::read_dir(root) else { return Stats::default() };
+    let mut here = Stats::default();
+    let mut subdirs = Vec::new();
+    for entry in entries.filter_map(Result::ok) {
+        let Ok(file_type) = entry.file_type() else { continue };
+        if file_type.is_symlink() {
+            continue; // symlinks and junctions are never followed or counted
+        }
+        if file_type.is_dir() {
+            subdirs.push(entry.path());
+            continue;
+        }
+        if !file_type.is_file() || !filter.matches(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        let Ok(md) = entry.metadata() else { continue };
+        let Ok(modified) = md.modified() else { continue };
+        if is_old(modified, min_age, now) {
+            here = merge(here, Stats { bytes: md.len(), files: 1, newest: Some(modified) });
+        }
+    }
+    let below = subdirs.par_iter().map(|d| summarize(d, filter, min_age, now)).reduce(Stats::default, merge);
+    merge(here, below)
+}
+
+fn merge(a: Stats, b: Stats) -> Stats {
+    Stats {
+        bytes: a.bytes + b.bytes,
+        files: a.files + b.files,
+        newest: match (a.newest, b.newest) {
+            (Some(x), Some(y)) => Some(x.max(y)),
+            (x, y) => x.or(y),
+        },
+    }
 }
 
 /// Directories under `root` (excluding `root`) last modified at least `min_age` ago,
@@ -125,6 +158,26 @@ mod tests {
         assert_eq!(s.files, 2);
         let newest_age = SystemTime::now().duration_since(s.newest.unwrap()).unwrap();
         assert!(newest_age < Duration::from_secs(31 * 3600) && newest_age > Duration::from_secs(29 * 3600));
+    }
+
+    #[test]
+    fn summarize_matches_candidates_on_nested_filtered_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        for (i, path) in ["a/x.db", "a/b/c/thumbcache_1.db", "thumbcache_2.db", "a/b/thumbcache_3.tmp", "d/e/f/g/thumbcache_4.db"]
+            .iter()
+            .enumerate()
+        {
+            file(&dir.path().join(path), 10 * (i + 1), 48);
+        }
+        file(&dir.path().join("d/thumbcache_new.db"), 999, 1);
+        let filter = NameFilter { prefix: Some("thumbcache_".into()), suffix: Some(".db".into()) };
+        let now = SystemTime::now();
+
+        let s = summarize(dir.path(), &filter, DAY, now);
+        let c = candidates(dir.path(), &filter, DAY, now);
+        assert_eq!(s.files, c.len() as u64);
+        assert_eq!(s.bytes, c.iter().map(|c| c.size).sum::<u64>());
+        assert_eq!(s.files, 3);
     }
 
     #[test]

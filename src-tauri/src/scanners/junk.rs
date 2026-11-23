@@ -238,12 +238,51 @@ pub fn recycle_bin_finding(bytes: u64, items: u64) -> Option<Finding> {
     })
 }
 
-pub fn scan_junk(p: &KnownPaths, sys: &dyn SystemOps, now: SystemTime) -> Vec<Finding> {
-    let mut found: Vec<Finding> = junk_locations(p).iter().filter_map(|l| scan_location(l, now)).collect();
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScanProgress {
+    /// Locations finished so far, including this one.
+    pub done: usize,
+    pub total: usize,
+    /// Title of the location that just finished.
+    pub title: String,
+}
+
+/// Scans every location in parallel, calling `on_progress` (from worker threads) as each finishes.
+pub fn scan_junk_with_progress(
+    p: &KnownPaths,
+    sys: &dyn SystemOps,
+    now: SystemTime,
+    on_progress: &(dyn Fn(ScanProgress) + Sync),
+) -> Vec<Finding> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let locations = junk_locations(p);
+    let total = locations.len() + 1; // + Recycle Bin
+    let done = AtomicUsize::new(0);
+    let tick = |title: &str| {
+        let done = done.fetch_add(1, Ordering::SeqCst) + 1;
+        on_progress(ScanProgress { done, total, title: title.to_string() });
+    };
+
+    let mut found: Vec<Finding> = locations
+        .par_iter()
+        .filter_map(|l| {
+            let f = scan_location(l, now);
+            tick(&l.title);
+            f
+        })
+        .collect();
     let (bytes, items) = sys.recycle_bin_info();
+    tick("Recycle Bin");
     found.extend(recycle_bin_finding(bytes, items));
     found.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.title.cmp(&b.title)));
     found
+}
+
+pub fn scan_junk(p: &KnownPaths, sys: &dyn SystemOps, now: SystemTime) -> Vec<Finding> {
+    scan_junk_with_progress(p, sys, now, &|_| {})
 }
 
 #[cfg(test)]
@@ -280,6 +319,10 @@ mod tests {
     fn scan_this_machine() {
         let p = KnownPaths::from_env().unwrap();
         let now = SystemTime::now();
+        let t = std::time::Instant::now();
+        let found = scan_junk(&p, &crate::sys::WindowsSys, now);
+        println!("parallel scan: {:.2}s, {} findings", t.elapsed().as_secs_f64(), found.len());
+        let now = SystemTime::now();
         for l in junk_locations(&p) {
             let t = std::time::Instant::now();
             if let Some(f) = scan_location(&l, now) {
@@ -287,6 +330,26 @@ mod tests {
             }
         }
         println!("total: {:.2}s", now.elapsed().unwrap().as_secs_f64());
+    }
+
+    #[test]
+    fn progress_is_reported_once_per_location_up_to_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_paths(dir.path());
+        file(&p.temp.join("old.tmp"), 10, 48);
+        let seen = std::sync::Mutex::new(Vec::new());
+
+        let found = scan_junk_with_progress(&p, &FakeSys(0, 0), SystemTime::now(), &|pr| seen.lock().unwrap().push(pr));
+
+        let seen = seen.into_inner().unwrap();
+        let total = junk_locations(&p).len() + 1; // + Recycle Bin
+        assert_eq!(seen.len(), total);
+        assert!(seen.iter().all(|s| s.total == total));
+        let mut done: Vec<usize> = seen.iter().map(|s| s.done).collect();
+        done.sort();
+        assert_eq!(done, (1..=total).collect::<Vec<_>>());
+        assert!(seen.iter().any(|s| s.title == "Your temporary files"));
+        assert_eq!(titles(&found), titles(&scan_junk(&p, &FakeSys(0, 0), SystemTime::now())));
     }
 
     #[test]
