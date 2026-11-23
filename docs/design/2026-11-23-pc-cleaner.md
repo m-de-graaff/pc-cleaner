@@ -76,6 +76,10 @@ Junk locations:
 | Chrome / Edge / Brave cache | `<User Data>\<profile>\Cache` and `\Code Cache` | 0 | safe | no |
 | Firefox cache | `%LOCALAPPDATA%\Mozilla\Firefox\Profiles\<profile>\cache2` | 0 | safe | no |
 | Recycle Bin | all drives | — | review | no |
+| Developer caches | npm, pnpm store, Yarn (v1 and Berry), Bun, Deno, node-gyp, Electron and electron-builder downloads, Playwright and Puppeteer browsers, Cargo registry cache, sources and git checkouts, rustup downloads and tmp, pip, uv, NuGet HTTP cache, Gradle caches, Maven repository, Go build cache, TypeScript server cache. These honour `CARGO_HOME`, `RUSTUP_HOME`, `npm_config_cache`, `GOCACHE`, `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `GRADLE_USER_HOME` and `YARN_CACHE_FOLDER` when set. | 0 | review | no |
+| App caches | VS Code, Discord, Slack and Teams (classic): Cache, CachedData, Code Cache, GPUCache. Also VS Code extension downloads, the Spotify cache, the Internet cache, and the DirectX and NVIDIA shader caches. | 0 | safe | no |
+
+Developer caches are marked review, not safe. They can always be regenerated, but downloading them again costs time and bandwidth, and clearing one while an install or build is running can break that run. The pnpm store is hard-linked into projects, so its reported size can overstate what clearing it actually frees. Its reason text recommends `pnpm store prune` instead. Package caches often mark files read-only; Rust's `std::fs::remove_file` on Windows deletes those anyway, and a regression test guards it. Project build outputs (`node_modules`, `target`) belong to piece 2.
 
 ### Piece 2 — Old dev projects + large/duplicate files (needs piece 1)
 

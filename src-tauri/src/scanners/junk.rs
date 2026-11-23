@@ -2,6 +2,7 @@ use crate::fsutil::{summarize, unix_secs};
 use crate::model::{Action, Category, Finding, NameFilter, Risk};
 use crate::scoring::{format_bytes, score};
 use crate::sys::SystemOps;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -9,18 +10,42 @@ pub struct KnownPaths {
     pub temp: PathBuf,
     pub windows: PathBuf,
     pub local_app_data: PathBuf,
+    pub app_data: PathBuf,
     pub program_data: PathBuf,
+    pub home: PathBuf,
+    /// Tool cache-location overrides (CARGO_HOME, GOCACHE, …) that are set on this machine.
+    pub env: HashMap<String, PathBuf>,
 }
+
+/// Environment variables developer tools use to move their caches.
+const OVERRIDE_VARS: [&str; 8] = [
+    "CARGO_HOME",
+    "RUSTUP_HOME",
+    "npm_config_cache",
+    "GOCACHE",
+    "PIP_CACHE_DIR",
+    "UV_CACHE_DIR",
+    "GRADLE_USER_HOME",
+    "YARN_CACHE_FOLDER",
+];
 
 impl KnownPaths {
     pub fn from_env() -> Option<Self> {
-        let env = |k: &str| std::env::var_os(k).map(PathBuf::from);
+        let env = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
         Some(Self {
             temp: std::env::temp_dir(),
             windows: env("SystemRoot")?,
             local_app_data: env("LOCALAPPDATA")?,
+            app_data: env("APPDATA")?,
             program_data: env("ProgramData")?,
+            home: env("USERPROFILE")?,
+            env: OVERRIDE_VARS.iter().filter_map(|k| env(k).map(|v| (k.to_string(), v))).collect(),
         })
+    }
+
+    /// `env[var]` if the tool's override is set, otherwise `default`.
+    fn tool_dir(&self, var: &str, default: PathBuf) -> PathBuf {
+        self.env.get(var).cloned().unwrap_or(default)
     }
 }
 
@@ -100,6 +125,69 @@ pub fn junk_locations(p: &KnownPaths) -> Vec<JunkLocation> {
     for (profile, root) in profiles(&p.local_app_data.join("Mozilla\\Firefox\\Profiles"), "cache2") {
         v.push(loc(format!("Firefox cache ({profile})"), root, 0, Risk::Safe, false, BROWSER_WHY));
     }
+    v.extend(dev_locations(p));
+    v.extend(app_locations(p));
+    v
+}
+
+const PKG_WHY: &str = "Downloaded packages kept so installs are faster. Your projects keep working; the next install downloads what it needs again. Close running installs and builds first.";
+const PNPM_WHY: &str = "pnpm's shared package store. Packages your projects still use stay on disk through hard links, so the space freed can be less than shown. Running `pnpm store prune` instead removes only unused packages.";
+const BUILD_WHY: &str = "Build outputs the tool recreates on the next build, which will take longer once. Close running builds first.";
+const BROWSERS_WHY: &str = "Browser engines downloaded for automated testing. Your test runner downloads them again the next time it needs them.";
+const APP_CACHE_WHY: &str = "The app rebuilds this cache when it needs it. Close the app first; files in use are skipped.";
+const SHADER_WHY: &str = "Compiled graphics shaders. Games and apps rebuild them, so the first launch afterwards may be a little slower.";
+
+/// Package-manager, toolchain and build caches. All regenerable, so permanent deletion is fine,
+/// but re-downloading costs time and bandwidth, so they need review rather than being pre-checked.
+fn dev_locations(p: &KnownPaths) -> Vec<JunkLocation> {
+    let local = &p.local_app_data;
+    let home = &p.home;
+    let cargo = p.tool_dir("CARGO_HOME", home.join(".cargo"));
+    let rustup = p.tool_dir("RUSTUP_HOME", home.join(".rustup"));
+    let gradle = p.tool_dir("GRADLE_USER_HOME", home.join(".gradle"));
+    let review = |title: &str, root: PathBuf, why: &'static str| loc(title, root, 0, Risk::Review, false, why);
+    vec![
+        review("npm cache", p.tool_dir("npm_config_cache", local.join("npm-cache")), PKG_WHY),
+        review("pnpm store", local.join("pnpm\\store"), PNPM_WHY),
+        review("Yarn cache", p.tool_dir("YARN_CACHE_FOLDER", local.join("Yarn\\Cache")), PKG_WHY),
+        review("Yarn Berry cache", local.join("Yarn\\Berry\\cache"), PKG_WHY),
+        review("Bun cache", home.join(".bun\\install\\cache"), PKG_WHY),
+        review("Deno cache", local.join("deno"), PKG_WHY),
+        review("node-gyp headers", local.join("node-gyp\\Cache"), PKG_WHY),
+        review("Electron downloads", local.join("electron\\Cache"), PKG_WHY),
+        review("electron-builder downloads", local.join("electron-builder\\Cache"), PKG_WHY),
+        review("Playwright browsers", local.join("ms-playwright"), BROWSERS_WHY),
+        review("Puppeteer browsers", home.join(".cache\\puppeteer"), BROWSERS_WHY),
+        review("Cargo downloaded crates", cargo.join("registry\\cache"), PKG_WHY),
+        review("Cargo extracted sources", cargo.join("registry\\src"), PKG_WHY),
+        review("Cargo git checkouts", cargo.join("git\\checkouts"), PKG_WHY),
+        review("Rustup downloads", rustup.join("downloads"), PKG_WHY),
+        review("Rustup temporary files", rustup.join("tmp"), PKG_WHY),
+        review("pip cache", p.tool_dir("PIP_CACHE_DIR", local.join("pip\\Cache")), PKG_WHY),
+        review("uv cache", p.tool_dir("UV_CACHE_DIR", local.join("uv\\cache")), PKG_WHY),
+        review("NuGet HTTP cache", local.join("NuGet\\v3-cache"), PKG_WHY),
+        review("Gradle caches", gradle.join("caches"), PKG_WHY),
+        review("Maven repository", home.join(".m2\\repository"), PKG_WHY),
+        review("Go build cache", p.tool_dir("GOCACHE", local.join("go-build")), BUILD_WHY),
+        review("TypeScript server cache", local.join("Microsoft\\TypeScript"), BUILD_WHY),
+    ]
+}
+
+/// Caches of everyday desktop apps and the graphics stack.
+fn app_locations(p: &KnownPaths) -> Vec<JunkLocation> {
+    let safe = |title: String, root: PathBuf, why: &'static str| loc(title, root, 0, Risk::Safe, false, why);
+    let mut v = Vec::new();
+    for (app, rel) in [("VS Code", "Code"), ("Discord", "discord"), ("Slack", "Slack"), ("Microsoft Teams (classic)", "Microsoft\\Teams")] {
+        for sub in ["Cache", "CachedData", "Code Cache", "GPUCache"] {
+            v.push(safe(format!("{app} cache ({sub})"), p.app_data.join(rel).join(sub), APP_CACHE_WHY));
+        }
+    }
+    v.push(safe("VS Code extension downloads".into(), p.app_data.join("Code\\CachedExtensionVSIXs"), APP_CACHE_WHY));
+    v.push(safe("Spotify cache".into(), p.local_app_data.join("Spotify\\Data"), APP_CACHE_WHY));
+    v.push(safe("Internet cache".into(), p.local_app_data.join("Microsoft\\Windows\\INetCache"), APP_CACHE_WHY));
+    v.push(safe("DirectX shader cache".into(), p.local_app_data.join("D3DSCache"), SHADER_WHY));
+    v.push(safe("NVIDIA DirectX shader cache".into(), p.local_app_data.join("NVIDIA\\DXCache"), SHADER_WHY));
+    v.push(safe("NVIDIA OpenGL shader cache".into(), p.local_app_data.join("NVIDIA\\GLCache"), SHADER_WHY));
     v
 }
 
@@ -174,8 +262,60 @@ mod tests {
             temp: dir.join("Temp"),
             windows: dir.join("Windows"),
             local_app_data: dir.join("Local"),
+            app_data: dir.join("Roaming"),
             program_data: dir.join("ProgramData"),
+            home: dir.join("Home"),
+            env: HashMap::new(),
         }
+    }
+
+    fn find<'a>(found: &'a [Finding], title: &str) -> &'a Finding {
+        found.iter().find(|f| f.title == title).unwrap_or_else(|| panic!("no finding titled {title:?} in {:?}", titles(found)))
+    }
+
+    #[test]
+    fn developer_caches_are_found_and_need_review() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_paths(dir.path());
+        file(&p.local_app_data.join("npm-cache/_cacache/content-v2/sha512/ab"), 10, 0);
+        file(&p.local_app_data.join("pnpm/store/v10/files/00/abc"), 10, 0);
+        file(&p.home.join(".cargo/registry/cache/index.crates.io-1/serde-1.0.0.crate"), 10, 0);
+        file(&p.home.join(".cargo/registry/src/index.crates.io-1/serde-1.0.0/lib.rs"), 10, 0);
+        file(&p.home.join(".gradle/caches/modules-2/x.jar"), 10, 0);
+
+        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        for title in ["npm cache", "pnpm store", "Cargo downloaded crates", "Cargo extracted sources", "Gradle caches"] {
+            let f = find(&found, title);
+            assert_eq!(f.risk, Risk::Review, "{title}");
+            assert!(!f.requires_admin, "{title}");
+        }
+    }
+
+    #[test]
+    fn app_caches_are_safe() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = fake_paths(dir.path());
+        file(&p.app_data.join("Code/CachedData/abc/x.bin"), 10, 0);
+        file(&p.local_app_data.join("D3DSCache/x"), 10, 0);
+
+        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        assert_eq!(find(&found, "VS Code cache (CachedData)").risk, Risk::Safe);
+        assert_eq!(find(&found, "DirectX shader cache").risk, Risk::Safe);
+    }
+
+    #[test]
+    fn env_overrides_move_tool_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut p = fake_paths(dir.path());
+        let custom = dir.path().join("custom-cargo");
+        p.env.insert("CARGO_HOME".into(), custom.clone());
+        file(&custom.join("registry/cache/idx/a.crate"), 30, 0);
+        file(&p.home.join(".cargo/registry/cache/idx/b.crate"), 99, 0);
+
+        let found = scan_junk(&p, &FakeSys(0, 0), SystemTime::now());
+        let cargo = find(&found, "Cargo downloaded crates");
+        assert_eq!(cargo.size_bytes, 30);
+        assert_eq!(found.iter().filter(|f| f.title == "Cargo downloaded crates").count(), 1);
     }
 
     fn titles(findings: &[Finding]) -> Vec<String> {

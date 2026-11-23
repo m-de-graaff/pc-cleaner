@@ -35,6 +35,7 @@ pub struct Executor<'a> {
 
 const MAX_ERRORS: usize = 5;
 
+
 impl Executor<'_> {
     pub fn run(&self, findings: &[Finding], dry_run: bool) -> ExecReport {
         let items: Vec<ItemResult> = findings
@@ -212,6 +213,24 @@ mod tests {
         assert!(!root.join("sub").exists(), "emptied old subfolder is removed");
         assert!(root.join("new.tmp").exists());
         assert!(root.exists());
+    }
+
+    #[test]
+    fn read_only_cache_files_are_deleted() {
+        let e = env();
+        let root = e.dir.path().join("cache");
+        let f = root.join("pkg/readonly.js");
+        file(&f, 40, 48);
+        let mut perms = std::fs::metadata(&f).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&f, perms).unwrap();
+        let sys = fake(0);
+
+        let report = exec(&e, &e.open, &sys, false).run(&[junk(&root, 0, false)], false);
+
+        assert_eq!(report.items[0].failed_count, 0, "{:?}", report.items[0].errors);
+        assert_eq!(report.total_freed, 40);
+        assert!(!f.exists());
     }
 
     #[test]
